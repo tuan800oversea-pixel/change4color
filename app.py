@@ -517,25 +517,26 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
     dark_strength = dark_color_strength(target_lab)
     white_strength = white_color_strength(target_lab)
     bright_strength = bright_flat_strength(target_lab)
-    bright_strength = bright_flat_strength(target_lab)
-    denoise_d = 3 if dark_strength > 0.35 else (7 if pale_strength >= 0.2 else 5)
-    sigma_color = 16 + int(round(30 * pale_strength - 4 * dark_strength + 18 * white_strength))
-    sigma_space = 16 + int(round(22 * pale_strength - 4 * dark_strength + 16 * white_strength))
-    sigma_color = max(10, sigma_color)
-    sigma_space = max(10, sigma_space)
+    denoise_d = 3 if (dark_strength > 0.35 or bright_strength > 0.22) else (7 if pale_strength >= 0.2 else 5)
+    sigma_color = 16 + int(round(30 * pale_strength - 4 * dark_strength + 18 * white_strength - 8 * bright_strength))
+    sigma_space = 16 + int(round(22 * pale_strength - 4 * dark_strength + 16 * white_strength - 8 * bright_strength))
+    sigma_color = max(8, sigma_color)
+    sigma_space = max(8, sigma_space)
     denoised_gray = cv2.bilateralFilter(gray_img, d=denoise_d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
-    blur_layer = cv2.GaussianBlur(denoised_gray, (15, 15), 0)
-    detail_gain = detail_boost * (1.0 - 0.58 * pale_strength - 0.22 * white_strength - 0.06 * dark_strength)
-    detail_layer = cv2.subtract(denoised_gray, blur_layer).astype(np.float32) * detail_gain
-    img_norm = denoised_gray.astype(np.float32) / 255.0
+    base_gray_weight = float(np.clip(0.54 + 0.42 * bright_strength - 0.10 * pale_strength, 0.48, 0.90))
+    base_gray = cv2.addWeighted(gray_img, base_gray_weight, denoised_gray, 1.0 - base_gray_weight, 0)
+    blur_layer = cv2.GaussianBlur(base_gray, (15, 15), 0)
+    detail_gain = detail_boost * (1.0 - 0.58 * pale_strength - 0.22 * white_strength - 0.06 * dark_strength + 0.30 * bright_strength)
+    detail_layer = cv2.subtract(base_gray, blur_layer).astype(np.float32) * detail_gain
+    img_norm = base_gray.astype(np.float32) / 255.0
     img_gamma = np.power(img_norm + 1e-7, 1.0 / max(gamma, 0.01))
     mask_bool = mask_3d[:, :, 0] > 0.08
     structure_mask = np.zeros_like(gray_img, dtype=np.float32)
     if np.any(mask_bool):
         detail_abs = np.abs(detail_layer[mask_bool])
         detail_scale = float(np.percentile(detail_abs, 88)) + 1e-6
-        grad_x = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-        grad_y = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+        grad_x = cv2.Sobel(base_gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(base_gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
         grad_mag = cv2.magnitude(grad_x, grad_y)
         grad_scale = float(np.percentile(grad_mag[mask_bool], 88)) + 1e-6
         structure_mask = np.clip((np.abs(detail_layer) / detail_scale) * 0.58 + (grad_mag / grad_scale) * 0.42, 0.0, 1.0)
@@ -548,6 +549,14 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
     target_l = np.clip(l_t + l_off, 0, 255)
     shift_l = (target_l / 255.0) - current_mean_l
     shadow_map = np.clip((img_gamma + shift_l) * 255.0 + detail_layer, 0, 255.0)
+    if np.any(mask_bool):
+        micro_base = gray_img.astype(np.float32)
+        micro_blur = cv2.GaussianBlur(micro_base, (0, 0), 1.15 + 0.25 * bright_strength)
+        micro_detail = micro_base - micro_blur
+        micro_scale = float(np.percentile(np.abs(micro_detail[mask_bool]), 90)) + 1e-6
+        micro_restore = np.clip((micro_detail / micro_scale) * (3.8 + 8.0 * bright_strength + 2.0 * (1.0 - pale_strength)), -15.0, 15.0)
+        micro_alpha = np.clip(mask_3d[:, :, 0] * (0.08 + 0.18 * bright_strength + 0.14 * structure_mask), 0.0, 1.0)
+        shadow_map = np.clip(shadow_map + micro_restore * micro_alpha, 0.0, 255.0)
     if white_strength > 0.03:
         highlight_map = np.clip((shadow_map - 118.0) / 110.0, 0.0, 1.0) * (1.0 - 0.55 * structure_mask)
         shadow_map = np.clip(shadow_map + highlight_map * (7.0 + 12.0 * white_strength), 0.0, 255.0)
@@ -613,6 +622,14 @@ def render_standard(orig_img: np.ndarray, gray_img: np.ndarray, mask_3d: np.ndar
         result_lab[:, :, 0] = np.clip(result_lab[:, :, 0] + l_alpha * (6.0 + 10.0 * white_strength), 0.0, 255.0)
         result_lab[:, :, 1] = result_lab[:, :, 1] * (1.0 - ab_alpha) + final_a * ab_alpha
         result_lab[:, :, 2] = result_lab[:, :, 2] * (1.0 - ab_alpha) + final_b * ab_alpha
+        result_bgr = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
+    if np.any(mask_bool):
+        result_lab = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        orig_micro = gray_img.astype(np.float32) - cv2.GaussianBlur(gray_img.astype(np.float32), (0, 0), 0.95 + 0.20 * bright_strength)
+        micro_scale = float(np.percentile(np.abs(orig_micro[mask_bool]), 89)) + 1e-6
+        micro_push = np.clip((orig_micro / micro_scale) * (2.8 + 6.5 * bright_strength + 1.2 * dark_strength), -11.0, 11.0)
+        tex_alpha = np.clip(mask_3d[:, :, 0] * (0.05 + 0.14 * bright_strength + 0.20 * structure_mask), 0.0, 1.0)
+        result_lab[:, :, 0] = np.clip(result_lab[:, :, 0] + micro_push * tex_alpha, 0.0, 255.0)
         result_bgr = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     final_f = (result_bgr.astype(np.float32) / 255.0) * mask_3d + (orig_img.astype(np.float32) / 255.0) * (1.0 - mask_3d)
     return (np.clip(final_f, 0, 1) * 255.0).astype(np.uint8)
@@ -717,8 +734,8 @@ def cleanup_vivid_flat_noise(
     low = cv2.resize(smooth, None, fx=0.4, fy=0.4, interpolation=cv2.INTER_AREA)
     low = cv2.GaussianBlur(low, (0, 0), 1.0 + 1.2 * strength)
     macro = cv2.resize(low, (result_bgr.shape[1], result_bgr.shape[0]), interpolation=cv2.INTER_CUBIC)
-    preserve = 1.0 - 0.76 * np.clip(structure_mask, 0.0, 1.0)
-    alpha = np.clip(flat_mask * (0.18 + 0.46 * strength) * preserve, 0.0, 1.0)
+    preserve = 1.0 - 0.82 * np.clip(structure_mask, 0.0, 1.0)
+    alpha = np.clip(flat_mask * (0.08 + 0.24 * strength) * preserve, 0.0, 1.0)
     return blend_with_alpha(result_bgr, macro, alpha)
 
 
@@ -727,26 +744,36 @@ def render_neon(orig_img: np.ndarray, mask_3d: np.ndarray, target_lab: np.ndarra
     l_t, a_t, b_t = target_lab.astype(float)
     gray = cv2.cvtColor(orig_img, cv2.COLOR_BGR2GRAY)
     denoised_gray = cv2.bilateralFilter(gray, d=7, sigmaColor=18, sigmaSpace=18)
+    bright_strength = bright_flat_strength(target_lab)
+    base_gray_weight = float(np.clip(0.68 + 0.22 * bright_strength, 0.66, 0.90))
+    base_gray = cv2.addWeighted(gray, base_gray_weight, denoised_gray, 1.0 - base_gray_weight, 0)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_detail = clahe.apply(denoised_gray).astype(np.float32) / 255.0
+    gray_detail = clahe.apply(base_gray).astype(np.float32) / 255.0
     mask_bool = mask_3d[:, :, 0] > 0.08
     avg_detail = float(np.mean(gray_detail[mask_bool])) if np.any(mask_bool) else 0.5
     detail_map = gray_detail - avg_detail
     detail_abs = np.abs(detail_map)
     detail_scale = float(np.percentile(detail_abs[mask_bool], 88)) + 1e-6 if np.any(mask_bool) else 1.0
-    grad_x = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(denoised_gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
+    grad_x = cv2.Sobel(base_gray.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(base_gray.astype(np.float32), cv2.CV_32F, 0, 1, ksize=3)
     grad_mag = cv2.magnitude(grad_x, grad_y)
     grad_scale = float(np.percentile(grad_mag[mask_bool], 88)) + 1e-6 if np.any(mask_bool) else 1.0
     structure_mask = np.clip((detail_abs / detail_scale) * 0.56 + (grad_mag / grad_scale) * 0.44, 0.0, 1.0)
     structure_mask = cv2.GaussianBlur(structure_mask, (7, 7), 0)
-    bright_strength = bright_flat_strength(target_lab)
     flat_mask = np.clip(mask_3d[:, :, 0] * (1.0 - np.clip(structure_mask, 0.0, 1.0)), 0.0, 1.0)
-    detail_gain_effective = detail_gain * (0.72 - 0.34 * bright_strength)
+    detail_gain_effective = detail_gain * (0.86 - 0.08 * bright_strength)
     target_l = np.clip(l_t + l_off, 0, 255)
     target_a = np.clip(a_t + a_off, 0, 255)
     target_b = np.clip(b_t + b_off, 0, 255)
     l_layer = np.clip(np.full(gray.shape, target_l, dtype=np.float32) + (detail_map * detail_gain_effective), 0, 255)
+    if np.any(mask_bool):
+        micro_base = gray.astype(np.float32)
+        micro_blur = cv2.GaussianBlur(micro_base, (0, 0), 1.0 + 0.15 * bright_strength)
+        micro_detail = micro_base - micro_blur
+        micro_scale = float(np.percentile(np.abs(micro_detail[mask_bool]), 90)) + 1e-6
+        micro_restore = np.clip((micro_detail / micro_scale) * (2.2 + 4.0 * bright_strength), -11.0, 11.0)
+        micro_alpha = np.clip(mask_3d[:, :, 0] * (0.05 + 0.10 * bright_strength + 0.10 * structure_mask), 0.0, 1.0)
+        l_layer = np.clip(l_layer + micro_restore * micro_alpha, 0.0, 255.0)
     final_lab = cv2.merge(
         [
             l_layer.astype(np.uint8),
@@ -757,10 +784,18 @@ def render_neon(orig_img: np.ndarray, mask_3d: np.ndarray, target_lab: np.ndarra
     res_bgr = cv2.cvtColor(final_lab, cv2.COLOR_LAB2BGR)
     smooth = cv2.bilateralFilter(res_bgr, d=9, sigmaColor=28 + int(round(12 * bright_strength)), sigmaSpace=24 + int(round(10 * bright_strength)))
     smooth = cv2.GaussianBlur(smooth, (0, 0), 0.9 + 0.8 * bright_strength)
-    smooth_alpha = np.clip(flat_mask * (0.22 + 0.42 * bright_strength), 0.0, 1.0)
+    smooth_alpha = np.clip(flat_mask * (0.10 + 0.24 * bright_strength), 0.0, 1.0)
     res_bgr = blend_with_alpha(res_bgr, smooth, smooth_alpha)
     if bright_strength > 0.05:
         res_bgr = cleanup_vivid_flat_noise(res_bgr, flat_mask, structure_mask, bright_strength)
+    if np.any(mask_bool):
+        result_lab = cv2.cvtColor(res_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+        orig_micro = gray.astype(np.float32) - cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 0.9 + 0.15 * bright_strength)
+        micro_scale = float(np.percentile(np.abs(orig_micro[mask_bool]), 89)) + 1e-6
+        micro_push = np.clip((orig_micro / micro_scale) * (1.8 + 3.2 * bright_strength), -8.0, 8.0)
+        tex_alpha = np.clip(mask_3d[:, :, 0] * (0.04 + 0.08 * bright_strength + 0.14 * structure_mask), 0.0, 1.0)
+        result_lab[:, :, 0] = np.clip(result_lab[:, :, 0] + micro_push * tex_alpha, 0.0, 255.0)
+        res_bgr = cv2.cvtColor(result_lab.astype(np.uint8), cv2.COLOR_LAB2BGR)
     final_out = res_bgr.astype(np.float32) * mask_3d + orig_img.astype(np.float32) * (1.0 - mask_3d)
     return np.clip(final_out, 0, 255).astype(np.uint8)
 
@@ -1527,16 +1562,19 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
                 {"name": "底裤", "mask_source": read_image_path(bottom_path)},
             ],
         }
-    if sample_name == "E":
+    if sample_name in {"E", "F"}:
         orig_path = folder / "11.jpg"
         mask_path = folder / "11.png"
+        if sample_name == "F":
+            orig_path = folder / "11_副本(2).jpg"
+            mask_path = folder / "11_副本.png"
         if not orig_path.exists() or not mask_path.exists():
-            raise FileNotFoundError(f"Sample E is missing required files: {folder}")
+            raise FileNotFoundError(f"Sample {sample_name} is missing required files: {folder}")
         return {
             "label": sample_name,
             "region_count": 1,
             "orig_img": read_image_path(orig_path),
-            "region_sources": [{"name": "??", "mask_source": read_image_path(mask_path)}],
+            "region_sources": [{"name": "主体", "mask_source": read_image_path(mask_path)}],
         }
     alpha_files = [path for path in files if read_image_path(path) is not None and extract_alpha(read_image_path(path)) is not None]
     mask_path = alpha_files[0] if alpha_files else files[-1]
@@ -1551,7 +1589,7 @@ def discover_sample_bundle(sample_name: str) -> dict[str, Any]:
 
 def available_sample_names() -> list[str]:
     names: list[str] = []
-    for sample_name in ["A", "B", "C", "D", "E"]:
+    for sample_name in ["A", "B", "C", "D", "E", "F"]:
         folder = APP_DIR / sample_name
         if not folder.exists() or not folder.is_dir():
             continue
